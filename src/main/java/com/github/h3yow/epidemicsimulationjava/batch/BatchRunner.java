@@ -1,5 +1,7 @@
 package com.github.h3yow.epidemicsimulationjava.batch;
 
+import com.github.h3yow.epidemicsimulationjava.capacity.CapacityGuard;
+import com.github.h3yow.epidemicsimulationjava.capacity.CapacityLimits;
 import com.github.h3yow.epidemicsimulationjava.model.ScenarioValidator;
 import com.github.h3yow.epidemicsimulationjava.simulation.ReplicationResult;
 import com.github.h3yow.epidemicsimulationjava.simulation.SimulationEngine;
@@ -36,6 +38,19 @@ public class BatchRunner {
 
     private static final Logger log = LoggerFactory.getLogger(BatchRunner.class);
 
+    private final CapacityGuard capacityGuard;
+
+    /** Spring constructor: capacity is enforced against the configured ceilings. */
+    @org.springframework.beans.factory.annotation.Autowired
+    public BatchRunner(CapacityGuard capacityGuard) {
+        this.capacityGuard = capacityGuard;
+    }
+
+    /** Convenience constructor with built-in default ceilings (used by direct unit tests). */
+    public BatchRunner() {
+        this(new CapacityGuard(CapacityLimits.defaults()));
+    }
+
     /**
      * Runs a batch to completion or fails as a whole.
      *
@@ -43,6 +58,8 @@ public class BatchRunner {
      * @return aggregate result (never partial)
      * @throws BatchCancelledException  if cancelled or timed out
      * @throws IllegalArgumentException if the request parameters are invalid
+     * @throws com.github.h3yow.epidemicsimulationjava.capacity.CapacityExceededException
+     *         if a configured ceiling is exceeded; thrown before any task is scheduled
      */
     public AggregateResult run(BatchRequest request) {
         ScenarioValidator.validate(request.scenario());
@@ -52,6 +69,9 @@ public class BatchRunner {
         if (request.parallelism() < 1) {
             throw new IllegalArgumentException("parallelism must be >= 1, got " + request.parallelism());
         }
+        // Reject oversized requests before seeds, threads or simulations exist.
+        capacityGuard.checkBatch(request.scenario().population(), request.scenario().horizonHours(),
+                request.replications(), request.parallelism());
 
         int reps = request.replications();
         long[] seeds = deriveSeeds(request.masterSeed(), reps);
@@ -163,13 +183,41 @@ public class BatchRunner {
             f.cancel(true);
         }
         pool.shutdownNow();
+        // The caller may itself be interrupted (that is often why the batch is
+        // cancelled); clear it for the duration of cleanup so the waits below
+        // are not cut short, and restore it afterwards.
+        boolean callerInterrupted = Thread.interrupted();
         try {
             if (!pool.awaitTermination(30, TimeUnit.SECONDS)) {
                 throw new IllegalStateException("worker pool did not terminate after cancellation");
             }
+            // awaitTermination signals task completion, but worker threads may still
+            // be executing their final (post-task) bookkeeping; wait deterministically
+            // for the threads themselves to die so no background work can outlive
+            // the rejected/aborted batch.
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (System.nanoTime() < deadline && hasAliveBatchWorker()) {
+                Thread.sleep(1);
+            }
+            if (hasAliveBatchWorker()) {
+                throw new IllegalStateException("batch-worker thread survived cancellation");
+            }
         } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+            callerInterrupted = true;
+        } finally {
+            if (callerInterrupted) {
+                Thread.currentThread().interrupt();
+            }
         }
+    }
+
+    private static boolean hasAliveBatchWorker() {
+        for (Thread t : Thread.getAllStackTraces().keySet()) {
+            if (t.getName().startsWith("batch-worker") && t.isAlive()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static void checkDeadline(long deadline, int nextIndex) {

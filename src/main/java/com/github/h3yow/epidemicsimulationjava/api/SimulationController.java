@@ -5,6 +5,9 @@ import com.github.h3yow.epidemicsimulationjava.batch.BatchCancelledException;
 import com.github.h3yow.epidemicsimulationjava.batch.BatchRequest;
 import com.github.h3yow.epidemicsimulationjava.batch.BatchRunner;
 import com.github.h3yow.epidemicsimulationjava.model.InvalidScenarioException;
+import com.github.h3yow.epidemicsimulationjava.simulation.ReplicationResult;
+import com.github.h3yow.epidemicsimulationjava.simulation.SingleSimulationRequest;
+import com.github.h3yow.epidemicsimulationjava.simulation.SimulationService;
 import java.util.Map;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -20,9 +23,17 @@ import org.springframework.web.bind.annotation.RestController;
 public class SimulationController {
 
     private final BatchRunner batchRunner;
+    private final SimulationService simulationService;
 
-    public SimulationController(BatchRunner batchRunner) {
+    public SimulationController(BatchRunner batchRunner, SimulationService simulationService) {
         this.batchRunner = batchRunner;
+        this.simulationService = simulationService;
+    }
+
+    /** Runs one stochastic scenario replication. */
+    @PostMapping("/single")
+    public ReplicationResult runSingle(@RequestBody SingleSimulationRequest request) {
+        return simulationService.run(request);
     }
 
     /** Runs a batch of stochastic replications and returns the aggregate result. */
