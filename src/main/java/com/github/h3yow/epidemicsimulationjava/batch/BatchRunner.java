@@ -1,5 +1,6 @@
 package com.github.h3yow.epidemicsimulationjava.batch;
 
+import com.github.h3yow.epidemicsimulationjava.capacity.CapacityGuard;
 import com.github.h3yow.epidemicsimulationjava.model.ScenarioValidator;
 import com.github.h3yow.epidemicsimulationjava.simulation.ReplicationResult;
 import com.github.h3yow.epidemicsimulationjava.simulation.SimulationEngine;
@@ -17,6 +18,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 /**
@@ -36,13 +38,28 @@ public class BatchRunner {
 
     private static final Logger log = LoggerFactory.getLogger(BatchRunner.class);
 
+    private final CapacityGuard capacityGuard;
+
+    /** Used by Spring: enforces the externally configured capacity limits. */
+    @Autowired
+    public BatchRunner(CapacityGuard capacityGuard) {
+        this.capacityGuard = capacityGuard;
+    }
+
+    /** Convenience constructor for tests with default capacity limits. */
+    public BatchRunner() {
+        this(new CapacityGuard());
+    }
+
     /**
      * Runs a batch to completion or fails as a whole.
      *
      * @param request batch request
      * @return aggregate result (never partial)
-     * @throws BatchCancelledException  if cancelled or timed out
-     * @throws IllegalArgumentException if the request parameters are invalid
+     * @throws BatchCancelledException     if cancelled or timed out
+     * @throws IllegalArgumentException    if the request parameters are invalid
+     * @throws com.github.h3yow.epidemicsimulationjava.capacity.CapacityExceededException
+     *         if a configured capacity bound is exceeded (rejected before any task is scheduled)
      */
     public AggregateResult run(BatchRequest request) {
         ScenarioValidator.validate(request.scenario());
@@ -52,6 +69,9 @@ public class BatchRunner {
         if (request.parallelism() < 1) {
             throw new IllegalArgumentException("parallelism must be >= 1, got " + request.parallelism());
         }
+        // Enforce external capacity limits strictly before seeds are derived or
+        // any worker task is scheduled.
+        capacityGuard.checkBatch(request);
 
         int reps = request.replications();
         long[] seeds = deriveSeeds(request.masterSeed(), reps);
@@ -59,8 +79,10 @@ public class BatchRunner {
                 ? System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(request.timeoutMillis())
                 : Long.MAX_VALUE;
 
-        log.info("batch start: replications={} parallelism={} masterSeed={} timeoutMillis={}",
-                reps, request.parallelism(), request.masterSeed(), request.timeoutMillis());
+        log.info("batch start: replications={} parallelism={} masterSeed={} timeoutMillis={} "
+                        + "population={} horizonHours={}",
+                reps, request.parallelism(), request.masterSeed(), request.timeoutMillis(),
+                request.scenario().population(), request.scenario().horizonHours());
 
         ReplicationResult[] results = request.parallelism() == 1
                 ? runSerial(request, seeds, deadline)
@@ -106,9 +128,14 @@ public class BatchRunner {
 
     private ReplicationResult[] runParallel(BatchRequest request, long[] seeds, long deadline) {
         int reps = seeds.length;
+        // Tracks the actual worker threads so cancellation can wait until the OS
+        // threads themselves have died (awaitTermination only guarantees task
+        // shutdown, not Thread.isAlive()==false).
+        java.util.List<Thread> workerThreads = new ArrayList<>();
         java.util.concurrent.ThreadFactory daemonFactory = runnable -> {
             Thread t = new Thread(runnable, "batch-worker");
             t.setDaemon(true);
+            workerThreads.add(t);
             return t;
         };
         ExecutorService pool = Executors.newFixedThreadPool(
@@ -147,28 +174,56 @@ public class BatchRunner {
             }
             return results;
         } catch (BatchCancelledException e) {
-            cancelAll(futures, pool);
+            cancelAll(futures, pool, workerThreads);
             throw e;
         } catch (RuntimeException e) {
-            cancelAll(futures, pool);
+            cancelAll(futures, pool, workerThreads);
             throw e;
         } finally {
+            // Normal completion path: shut down and also wait for the worker
+            // threads themselves to die, so no "batch-worker" thread outlives
+            // the batch even after a successful return.
             pool.shutdown();
+            awaitWorkerDeath(pool, workerThreads);
         }
     }
 
-    /** Interrupts every task and waits until the pool has fully terminated. */
-    private static void cancelAll(List<Future<ReplicationResult>> futures, ExecutorService pool) {
+    /**
+     * Interrupts every task, shuts the pool down and waits until both the pool
+     * has terminated and every worker thread has actually died. No background
+     * work survives this call.
+     */
+    private static void cancelAll(List<Future<ReplicationResult>> futures, ExecutorService pool,
+                                  java.util.List<Thread> workerThreads) {
         for (Future<?> f : futures) {
             f.cancel(true);
         }
         pool.shutdownNow();
+        awaitWorkerDeath(pool, workerThreads);
+    }
+
+    /** Awaits pool termination and then joins every worker thread until it is dead. */
+    private static void awaitWorkerDeath(ExecutorService pool, java.util.List<Thread> workerThreads) {
         try {
             if (!pool.awaitTermination(30, TimeUnit.SECONDS)) {
-                throw new IllegalStateException("worker pool did not terminate after cancellation");
+                throw new IllegalStateException("worker pool did not terminate");
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+        }
+        for (Thread t : workerThreads) {
+            if (t == Thread.currentThread()) {
+                continue;
+            }
+            try {
+                t.join(30_000L);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new BatchCancelledException(false, "interrupted while waiting for worker to die");
+            }
+            if (t.isAlive()) {
+                throw new IllegalStateException("worker thread " + t.getName() + " survived the batch");
+            }
         }
     }
 

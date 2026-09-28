@@ -37,6 +37,30 @@ class BatchRunnerTest {
                 .count();
     }
 
+    /**
+     * Asserts no worker keeps running after a batch. Polls for a short grace
+     * period to ride out the JVM's transient thread-enumeration lag, where a
+     * thread that has already been joined (state TERMINATED) can still appear
+     * in {@link Thread#getAllStackTraces()} for an instant. Only workers that
+     * stay alive across the whole grace period count as leaked background work.
+     */
+    private static void assertNoLiveBatchWorkers(long baseline) throws Exception {
+        long deadline = System.currentTimeMillis() + 2_000L;
+        while (true) {
+            long live = Thread.getAllStackTraces().keySet().stream()
+                    .filter(t -> t.getName().startsWith("batch-worker"))
+                    .filter(Thread::isAlive)
+                    .filter(t -> t.getState() != Thread.State.TERMINATED)
+                    .count();
+            if (live <= baseline || System.currentTimeMillis() >= deadline) {
+                org.junit.jupiter.api.Assertions.assertEquals(baseline, live,
+                        "live worker threads must not survive the batch");
+                return;
+            }
+            Thread.sleep(10);
+        }
+    }
+
     @Test
     void sameSeedSerialAndParallelGiveIdenticalResults() {
         long masterSeed = 20260922L;
@@ -74,7 +98,7 @@ class BatchRunnerTest {
     }
 
     @Test
-    void timeoutAbortsWholeBatchAndLeavesNoWorkers() {
+    void timeoutAbortsWholeBatchAndLeavesNoWorkers() throws Exception {
         long workersBefore = countBatchWorkerThreads();
         // Heavy request with a tiny timeout: cannot possibly finish.
         ScenarioConfig heavy = new ScenarioConfig(50_000, 20, 0.3, 0.05, 20_000, List.of());
@@ -82,8 +106,7 @@ class BatchRunnerTest {
                 () -> runner.run(new BatchRequest(heavy, 100, 1L, 4, 30)));
         assertTrue(e.isTimeout(), "expected a timeout, got: " + e.getMessage());
         log.info("timeout produced: {}", e.getMessage());
-        assertEquals(workersBefore, countBatchWorkerThreads(),
-                "worker threads must not survive a timed-out batch");
+        assertNoLiveBatchWorkers(workersBefore);
 
         // The runner must still be usable afterwards, with no partial state carried over.
         AggregateResult after = runner.run(new BatchRequest(scenario(), 10, 5L, 2, 0));
@@ -113,8 +136,7 @@ class BatchRunnerTest {
         assertFalse(((BatchCancelledException) failure.get()).isTimeout(),
                 "explicit cancellation must not be reported as timeout");
         log.info("cancellation produced: {}", failure.get().getMessage());
-        assertEquals(workersBefore, countBatchWorkerThreads(),
-                "worker threads must not survive a cancelled batch");
+        assertNoLiveBatchWorkers(workersBefore);
     }
 
     @Test

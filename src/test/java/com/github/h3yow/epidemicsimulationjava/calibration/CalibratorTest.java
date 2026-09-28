@@ -128,4 +128,102 @@ class CalibratorTest {
         assertEquals(CalibrationFailureReason.NON_CONVERGENCE, result.failureReason());
         log.info("rejected as {}: {}", result.failureReason(), result.message());
     }
+
+    // ------------------------------------------------------------------
+    // Noisy observations: interval must reflect the noise, never collapse
+    // ------------------------------------------------------------------
+
+    /** Mean curve plus i.i.d. Gaussian observation noise (clipped at 0). */
+    private double[] noisyObservations(double noiseSigma, long noiseSeed) {
+        double[] mean = syntheticObservations();
+        java.util.SplittableRandom rng = new java.util.SplittableRandom(noiseSeed);
+        double[] noisy = new double[mean.length];
+        for (int t = 0; t < mean.length; t++) {
+            noisy[t] = Math.max(0.0, mean[t] + noiseSigma * rng.nextGaussian());
+        }
+        return noisy;
+    }
+
+    @Test
+    void noisyObservationsGiveNonDegenerateIntervalReflectingNoise() {
+        double sigma = 30.0;
+        double[] noisy = noisyObservations(sigma, 4242L);
+        CalibrationResult result = calibrator.calibrate(request(noisy, 500));
+        log.info("noisy calibration: success={} beta={} CI95=[{}, {}] width={} noiseSigma={} sse={}",
+                result.success(), result.estimatedBeta(), result.betaLower95(),
+                result.betaUpper95(),
+                result.success() ? result.betaUpper95() - result.betaLower95() : Double.NaN,
+                result.noiseSigma(), result.objectiveValue());
+        assertTrue(result.success(), "expected success, got " + result.failureReason());
+        assertEquals(TRUE_BETA, result.estimatedBeta(), 0.02,
+                "estimate should still be close to the true beta under noise");
+        // Interval brackets the estimate and is meaningfully wider than a point.
+        assertTrue(result.betaLower95() < result.estimatedBeta()
+                        && result.estimatedBeta() < result.betaUpper95(),
+                "CI must strictly bracket the estimate");
+        double width = result.betaUpper95() - result.betaLower95();
+        assertTrue(width > 1e-4, "noisy-data CI must not collapse to a point, got width " + width);
+        // The reported noise level must reflect the injected observation noise.
+        assertTrue(result.noiseSigma() >= sigma * 0.5,
+                "noiseSigma should reflect the observation noise, got " + result.noiseSigma());
+    }
+
+    @Test
+    void noisyCalibrationIsStableAcrossRepeatsAndParallelism() {
+        double[] noisy = noisyObservations(30.0, 4242L);
+        CalibrationRequest serial = new CalibrationRequest(
+                scenario(0.2), noisy, 0.1, 0.8, REPS, SEED, 1, 500);
+        CalibrationRequest parallel = new CalibrationRequest(
+                scenario(0.2), noisy, 0.1, 0.8, REPS, SEED, 8, 500);
+        CalibrationResult a = calibrator.calibrate(serial);
+        CalibrationResult b = calibrator.calibrate(parallel);
+        CalibrationResult c = calibrator.calibrate(serial);
+        assertTrue(a.success() && b.success() && c.success());
+        assertEquals(a.estimatedBeta(), b.estimatedBeta(), 0.0);
+        assertEquals(a.betaLower95(), b.betaLower95(), 0.0);
+        assertEquals(a.betaUpper95(), b.betaUpper95(), 0.0);
+        assertEquals(a.estimatedBeta(), c.estimatedBeta(), 0.0);
+        assertEquals(a.betaLower95(), c.betaLower95(), 0.0);
+        assertEquals(a.betaUpper95(), c.betaUpper95(), 0.0);
+        log.info("noisy stability: serial CI=[{},{}] parallel8 CI=[{},{}] repeat CI=[{},{}]",
+                a.betaLower95(), a.betaUpper95(), b.betaLower95(), b.betaUpper95(),
+                c.betaLower95(), c.betaUpper95());
+    }
+
+    @Test
+    void largerObservationNoiseProducesNoNarrowerInterval() {
+        double[] lowNoise = noisyObservations(5.0, 4242L);
+        double[] highNoise = noisyObservations(60.0, 4242L);
+        CalibrationResult low = calibrator.calibrate(request(lowNoise, 500));
+        CalibrationResult high = calibrator.calibrate(request(highNoise, 500));
+        assertTrue(low.success() && high.success());
+        double lowWidth = low.betaUpper95() - low.betaLower95();
+        double highWidth = high.betaUpper95() - high.betaLower95();
+        log.info("noise/width: sigma=5 width={} sigma=60 width={}", lowWidth, highWidth);
+        assertTrue(highWidth >= lowWidth,
+                "interval under high noise must be no narrower than under low noise");
+        assertTrue(high.noiseSigma() > low.noiseSigma());
+    }
+
+    @Test
+    void flatObservationsAreReportedAsParameterUnidentifiable() {
+        double[] flat = new double[120];
+        java.util.Arrays.fill(flat, 15.0);
+        CalibrationResult result = calibrator.calibrate(
+                new CalibrationRequest(scenario(0.2), flat, 0.1, 0.8, 60, SEED, 4, 500));
+        assertFalse(result.success());
+        assertEquals(CalibrationFailureReason.PARAMETER_UNIDENTIFIABLE, result.failureReason());
+        log.info("rejected as {}: {}", result.failureReason(), result.message());
+    }
+
+    @Test
+    void capacityRejectionCarriesDimensionAsDetailReason() {
+        double[] observed = syntheticObservations();
+        CalibrationResult tooMany = calibrator.calibrate(new CalibrationRequest(
+                scenario(0.2), observed, 0.1, 0.8, 5_000, SEED, 4, 10));
+        assertFalse(tooMany.success());
+        assertEquals(CalibrationFailureReason.RESOURCE_LIMIT_EXCEEDED, tooMany.failureReason());
+        assertEquals("REPLICATIONS", tooMany.detailReason());
+        log.info("capacity rejection detail: {}", tooMany.detailReason());
+    }
 }

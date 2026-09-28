@@ -8,6 +8,12 @@ public enum CalibrationFailureReason {
     INSUFFICIENT_DATA,
     /** Optimiser exhausted its iteration budget without a stable optimum. */
     NON_CONVERGENCE,
+    /**
+     * Data do not carry enough information to identify beta (flat objective,
+     * profile interval never closes inside the bounds, etc.). Reported rather
+     * than a misleadingly narrow "successful" interval.
+     */
+    PARAMETER_UNIDENTIFIABLE,
     /** Requested work exceeds the configured resource budget; rejected before running. */
     RESOURCE_LIMIT_EXCEEDED
 }
