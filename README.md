@@ -35,9 +35,31 @@
 - 结论：同一 `(scenario, replications, masterSeed)` 在任意 `parallelism` 下，
   逐次结果与聚合结果**完全一致**（测试中以 0 容差断言）。
 - 日志会打印 `masterSeed`、`parallelism`、`replications` 与聚合结果等关键输入输出。
-- **取消 / 超时**：整体生效。所有任务被中断、线程池关闭并等待终止后抛出
-  `BatchCancelledException`（`isTimeout()` 区分超时与显式取消）；绝不返回部分结果，
-  不留后台运行的任务（测试断言工作线程数归零）。
+
+## 取消与超时的收尾语义
+
+批量重复（`BatchRunner`，被 `/api/simulation/batch` 与校准内部调用）对**显式取消**
+（调用线程被中断，例如上层超时或连接关闭）与**整体超时**（`timeoutMillis` 到期）
+提供如下保证：
+
+- **返回即静默（quiescence）**：`run(...)` 一旦返回——无论是正常返回还是抛出
+  `BatchCancelledException`——属于该批次的**所有 worker 线程都已真正终止**，不存在任何
+  还在后台占 CPU 的计算。收尾流程会先 `cancel(true)` + `shutdownNow()` 中断全部在跑与排队
+  的任务，再**不可中断地**等待线程池终止并逐个 `join` worker 直到 `Thread.isAlive()==false`；
+  等待期间即使调用线程再次收到中断也不会提前返回（中断状态会在收尾结束后原样恢复）。
+  每个批次使用独立的、命名为 `batch-worker-<批次号>` 的守护线程池，批次结束池即销毁，
+  因此连续取消只会看到线程随批次快速消失，不会堆积。
+- **整体失败，绝无部分结果**：取消或超时都抛出 `BatchCancelledException`，已完成的重复
+  结果一律丢弃，不返回聚合。
+- **两类失败严格区分且稳定**：异常的 `isTimeout()` 为 `true` 当且仅当是超时；显式中断
+  一律是取消（`isTimeout()==false`），**即使调用进入时中断标志已置位、或中断与 deadline
+  到期同时发生，取消也优先，绝不会把取消误报成超时或反之**。HTTP 层据此分别返回
+  `{"error":"CANCELLED"}` 与 `{"error":"TIMEOUT"}`（均为 408）。
+- **串行 / 并行行为一致**：`parallelism == 1` 的串行路径（不建池，同一线程内协作式
+  检查中断）与并行路径遵守完全相同的取消/超时分类与整体失败语义；并行下无论并发度
+  （2..16）多大、取消发生在任务排队、部分运行还是收尾阶段，收尾都干净。
+- **取消后无残留状态**：`BatchRunner` 不保留跨批次状态；一次取消返回后再发起正常批次，
+  既不会失败，也不会串入上一批的种子、结果或线程。
 
 ## 校准不确定度：带噪声观测下的区间
 
@@ -132,7 +154,7 @@ mvn spring-boot:run -Dspring-boot.run.arguments=--app.capacity.max-total-simulat
 ## 本地验证
 
 ```bash
-mvn test                 # 全部自动化测试（69 个）
+mvn test                 # 全部自动化测试（76 个）
 mvn spring-boot:run      # 启动服务（默认 8080）
 
 # 另一个终端：端到端 HTTP 走查（正常推演 / 批量串并行一致 / 带噪声校准 /
@@ -142,7 +164,29 @@ bash scripts/e2e.sh
 
 # 验证外部容量覆盖（不改代码，把重复数上限调成 3）
 APP_CAPACITY_MAX_REPLICATIONS=3 mvn spring-boot:run
+
+# 只跑取消/超时收尾相关用例（确定性栅栏，在 worker 运行中触发取消）
+mvn -Dtest=BatchCancellationTest test
+# 既有的取消/超时与串并行一致性用例
+mvn -Dtest=BatchRunnerTest test
 ```
+
+如何在本地复现「取消返回瞬间后台已无计算线程」：
+
+- 自动化方式：`BatchCancellationTest` 通过包内可见的测试插桩点
+  （`BatchRunner.replicationHook`，生产代码恒为 `null`）把每个 worker 在**刚进入某次
+  重复计算时**挂在一个确定性栅栏上，然后中断调用线程；断言的是 `run()` 返回的那一帧
+  所捕获到的本批 worker 线程**逐个 `isAlive()==false`**（不是靠事后轮询宽限），并覆盖：
+  - 并行度 2 / 8 / 16 下在运行中取消，返回瞬间本批 worker 全部已终止；
+  - **连续 6 次**在满并发（16）运行中取消，线程不堆积、每次返回均为 0 残留；
+  - 调用进入时已带中断信号（且 deadline 也已过期）→ 仍判定为取消而非超时；
+  - worker 运行中超时 → 判定为超时、返回瞬间线程全灭；
+  - 取消发生时仍有大量任务排队（reps ≫ workers）→ 排队任务同样被清理；
+  - 串行路径（`parallelism=1`）取消的分类与整体失败；
+  - 连续取消后再发正常批次：成功、与串行结果 0 容差一致、且无 worker 残留。
+- 手工方式：启动服务后对 `POST /api/simulation/batch` 发一个重负载请求
+  （大人群、大 `horizonHours`、较多 `replications`），在返回前中断客户端（如关闭连接 /
+  Ctrl-C 掉请求）；随后用 `jstack <pid>` 观察，应看不到任何存活的 `batch-worker-*` 线程。
 
 自动化测试覆盖：
 
@@ -154,5 +198,8 @@ APP_CAPACITY_MAX_REPLICATIONS=3 mvn spring-boot:run
   `noiseSigma` 反映噪声、同请求串行/并行(1/8)/重复逐位一致、平坦观测判为
   `PARAMETER_UNIDENTIFIABLE`、容量拒绝带 `detailReason`。
 - HTTP 端到端（`ApiEndToEndTest`）：真实 Spring 上下文走全部路径并断言状态码与结论。
-- 既有行为无回归：干预窗口边界、非法/冲突配置、取消/超时全有或全无（无线程泄漏）、
-  同种子串并行逐次一致、校准失败分类与可复现性。
+- 取消/超时收尾（`BatchCancellationTest`、`BatchRunnerTest`）：返回瞬间本批 worker
+  线程全部终止、连续多次取消不堆积、取消与超时不互相误报（含进入时已中断）、排队任务
+  一并清理、串行/并行语义一致、取消后新批次正常且与串行结果逐位一致。
+- 既有行为无回归：干预窗口边界、非法/冲突配置、容量逐维拒绝、同种子串并行逐次一致、
+  校准失败分类与可复现性。
