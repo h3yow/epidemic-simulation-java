@@ -38,6 +38,21 @@ class BatchRunnerTest {
     }
 
     /**
+     * Blocks until batch worker threads are actually running, so a cancellation
+     * test interrupts mid-flight rather than racing a batch that already
+     * finished under a loaded machine.
+     */
+    private static void awaitBatchWorkersRunning() throws InterruptedException {
+        long deadline = System.currentTimeMillis() + 5_000L;
+        while (countBatchWorkerThreads() == 0) {
+            if (System.currentTimeMillis() >= deadline) {
+                throw new AssertionError("batch workers never started");
+            }
+            Thread.sleep(2);
+        }
+    }
+
+    /**
      * Asserts no worker keeps running after a batch. Polls for a short grace
      * period to ride out the JVM's transient thread-enumeration lag, where a
      * thread that has already been joined (state TERMINATED) can still appear
@@ -100,10 +115,11 @@ class BatchRunnerTest {
     @Test
     void timeoutAbortsWholeBatchAndLeavesNoWorkers() throws Exception {
         long workersBefore = countBatchWorkerThreads();
-        // Heavy request with a tiny timeout: cannot possibly finish.
+        // Heavy request with a 1ms timeout: one replication alone takes ~16ms,
+        // so the deadline can never be met, even on a fast/unloaded machine.
         ScenarioConfig heavy = new ScenarioConfig(50_000, 20, 0.3, 0.05, 20_000, List.of());
         BatchCancelledException e = assertThrows(BatchCancelledException.class,
-                () -> runner.run(new BatchRequest(heavy, 100, 1L, 4, 30)));
+                () -> runner.run(new BatchRequest(heavy, 100, 1L, 4, 1)));
         assertTrue(e.isTimeout(), "expected a timeout, got: " + e.getMessage());
         log.info("timeout produced: {}", e.getMessage());
         assertNoLiveBatchWorkers(workersBefore);
@@ -123,10 +139,15 @@ class BatchRunnerTest {
                 runner.run(new BatchRequest(heavy, 100, 2L, 4, 0));
             } catch (Throwable t) {
                 failure.set(t);
+            } finally {
+                // BatchRunner restores the caller's interrupt status on return;
+                // consume it here so it cannot leak onto whatever this JUnit
+                // worker thread runs next.
+                Thread.interrupted();
             }
         }, "cancelling-caller");
         canceller.start();
-        Thread.sleep(50); // let the batch get going
+        awaitBatchWorkersRunning();
         canceller.interrupt();
         canceller.join(30_000);
 
@@ -137,6 +158,125 @@ class BatchRunnerTest {
                 "explicit cancellation must not be reported as timeout");
         log.info("cancellation produced: {}", failure.get().getMessage());
         assertNoLiveBatchWorkers(workersBefore);
+    }
+
+    /**
+     * Real-engine version of the strict guarantee, with zero grace period:
+     * evaluated at the exact instant run() reports cancellation, no
+     * batch-worker thread may still be alive.
+     */
+    @Test
+    void realEngineParallelCancellationHasNoLiveWorkersAtReturnInstant() throws Exception {
+        ScenarioConfig heavy = new ScenarioConfig(50_000, 20, 0.3, 0.05, 20_000, List.of());
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        Thread canceller = new Thread(() -> {
+            try {
+                runner.run(new BatchRequest(heavy, 100, 11L, 8, 0));
+            } catch (Throwable t) {
+                failure.set(t);
+            } finally {
+                Thread.interrupted();
+            }
+        }, "real-engine-cancelling-caller");
+        canceller.start();
+        awaitBatchWorkersRunning();
+        canceller.interrupt();
+        canceller.join(30_000);
+
+        assertFalse(canceller.isAlive(), "batch did not react to cancellation in time");
+        assertTrue(failure.get() instanceof BatchCancelledException,
+                "expected BatchCancelledException, got " + failure.get());
+        assertFalse(((BatchCancelledException) failure.get()).isTimeout(),
+                "cancellation must not be reported as timeout");
+        // Strict, no polling/grace: at the return instant itself.
+        long liveAtReturn = countBatchWorkerThreads();
+        org.junit.jupiter.api.Assertions.assertEquals(0L, liveAtReturn,
+                "at the instant cancellation returned, batch-worker threads were still alive");
+    }
+
+    /**
+     * Cancel several heavy real-engine batches back-to-back on one runner; at
+     * each return instant no workers linger, and a final healthy batch succeeds.
+     */
+    @Test
+    void repeatedRealEngineCancellationsStayCleanAndDoNotPoisonRunner() throws Exception {
+        ScenarioConfig heavy = new ScenarioConfig(50_000, 20, 0.3, 0.05, 20_000, List.of());
+        for (int round0 = 0; round0 < 3; round0++) {
+            final int round = round0;
+            AtomicReference<Throwable> failure = new AtomicReference<>();
+            Thread canceller = new Thread(() -> {
+                try {
+                    runner.run(new BatchRequest(heavy, 100, 20L + round, 8, 0));
+                } catch (Throwable t) {
+                    failure.set(t);
+                } finally {
+                    Thread.interrupted();
+                }
+            }, "repeated-cancelling-caller-" + round);
+            canceller.start();
+            awaitBatchWorkersRunning();
+            canceller.interrupt();
+            canceller.join(30_000);
+            assertFalse(canceller.isAlive(), "round " + round + " did not return");
+            assertTrue(failure.get() instanceof BatchCancelledException,
+                    "round " + round + ": expected BatchCancelledException, got " + failure.get());
+            assertFalse(((BatchCancelledException) failure.get()).isTimeout(),
+                    "round " + round + ": cancellation misreported as timeout");
+            org.junit.jupiter.api.Assertions.assertEquals(0L, countBatchWorkerThreads(),
+                    "round " + round + ": workers alive at the cancellation return instant");
+        }
+        AggregateResult after = runner.run(new BatchRequest(scenario(), 12, 7L, 4, 0));
+        assertEquals(12, after.replications());
+    }
+
+    /**
+     * Serial cancellation must report cancellation and never timeout. Instead
+     * of guessing a warmup delay, the driver waits until the caller thread is
+     * observably inside BatchRunner.run, then interrupts it — deterministic
+     * regardless of scheduling.
+     */
+    @Test
+    void serialCancellationIsCancellationNotTimeout() throws Exception {
+        ScenarioConfig heavy = new ScenarioConfig(50_000, 20, 0.3, 0.05, 20_000, List.of());
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        Thread canceller = new Thread(() -> {
+            try {
+                runner.run(new BatchRequest(heavy, 1_000, 30L, 1, 0));
+            } catch (Throwable t) {
+                failure.set(t);
+            } finally {
+                Thread.interrupted();
+            }
+        }, "serial-cancelling-caller");
+        canceller.start();
+        awaitThreadInMethod(canceller, "com.github.h3yow.epidemicsimulationjava.batch.BatchRunner.run");
+        canceller.interrupt();
+        canceller.join(30_000);
+        assertFalse(canceller.isAlive());
+        assertTrue(failure.get() instanceof BatchCancelledException,
+                "expected BatchCancelledException, got " + failure.get());
+        assertFalse(((BatchCancelledException) failure.get()).isTimeout(),
+                "serial cancellation must not be reported as timeout");
+    }
+
+    /**
+     * Polls the target thread's stack until {@code method} appears, proving the
+     * thread has entered that method (so a subsequent interrupt lands in-flight).
+     */
+    private static void awaitThreadInMethod(Thread target, String method) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + 10_000L;
+        while (System.currentTimeMillis() < deadline) {
+            for (StackTraceElement e : target.getStackTrace()) {
+                if ((e.getClassName() + "." + e.getMethodName()).equals(method)) {
+                    return;
+                }
+            }
+            if (!target.isAlive()) {
+                throw new AssertionError("target thread exited before entering " + method);
+            }
+            Thread.sleep(2);
+        }
+        throw new AssertionError("target thread never entered " + method);
     }
 
     @Test

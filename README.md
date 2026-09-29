@@ -35,9 +35,29 @@
 - 结论：同一 `(scenario, replications, masterSeed)` 在任意 `parallelism` 下，
   逐次结果与聚合结果**完全一致**（测试中以 0 容差断言）。
 - 日志会打印 `masterSeed`、`parallelism`、`replications` 与聚合结果等关键输入输出。
-- **取消 / 超时**：整体生效。所有任务被中断、线程池关闭并等待终止后抛出
-  `BatchCancelledException`（`isTimeout()` 区分超时与显式取消）；绝不返回部分结果，
-  不留后台运行的任务（测试断言工作线程数归零）。
+
+### 取消 / 超时：全有或全无，且「返回即代表已全部停下」
+
+批量重复在并行执行到一半被取消（例如上层超时或关闭连接、中断了本次调用的执行
+线程）时，收尾语义是严格的：
+
+- **整体失败**：取消或超时都只会抛出 `BatchCancelledException`，绝不返回部分结果。
+  异常上的 `isTimeout()` 稳定区分两种语义——中断（包括调用进入时就已带有的中断信号）
+  永远报「取消」（`isTimeout()==false`），deadline 到期且无中断永远报「超时」
+  （`isTimeout()==true`）；两者同时出现时取消优先，不会互相误报。
+- **返回即收尾完成**：抛出异常之前，所有在跑的任务都会被中断、线程池被关闭，
+  并且 `run` 会**阻塞到属于本批次的每一个 worker 线程真正终止**（不仅是
+  `awaitTermination` 完成，还逐个 `join` 到 `Thread.isAlive()==false`）。
+  因此取消/超时返回的那一刻，已经没有任何后台计算在跑、没有任何 `batch-worker-*`
+  线程存活；连续多次取消也不会堆积线程。
+- **等待收尾时对调用方自身的中断不敏感**：收尾阶段会临时清除调用线程的中断位再等待，
+  避免「等待被自身中断立即打断 → worker 还活着就返回」的泄漏；等待结束后再按语义恢复。
+  取消会保留调用线程的中断状态；超时则**不会**设置中断位（超时不是中断，避免污染同一
+  线程上紧接着的下一次正常调用）。
+- **串并行一致**：串行（`parallelism=1`）与并行路径遵守同一套判定顺序（先看中断、再看
+  deadline）与全有或全无语义。每个批次使用独立线程池，线程名带批次编号
+  （`batch-worker-<batchId>`）；取消之后立即发起新的正常批量请求，不会受上一次残留
+  状态影响，也不会串结果。
 
 ## 校准不确定度：带噪声观测下的区间
 
@@ -132,7 +152,7 @@ mvn spring-boot:run -Dspring-boot.run.arguments=--app.capacity.max-total-simulat
 ## 本地验证
 
 ```bash
-mvn test                 # 全部自动化测试（69 个）
+mvn test                 # 全部自动化测试（78 个）
 mvn spring-boot:run      # 启动服务（默认 8080）
 
 # 另一个终端：端到端 HTTP 走查（正常推演 / 批量串并行一致 / 带噪声校准 /
@@ -144,8 +164,37 @@ bash scripts/e2e.sh
 APP_CAPACITY_MAX_REPLICATIONS=3 mvn spring-boot:run
 ```
 
+### 复现并验证「取消返回瞬间后台线程已全部结束」
+
+取消收尾由两个测试类负责，建议单独、重复运行以确认稳定（它们不依赖固定 sleep，
+中断时机用「worker 已确实开始运行」/「调用线程已进入 run()」同步）：
+
+```bash
+# 确定性复现（注入一个「收到中断后仍有 250ms 收尾延迟」的可控重复任务）：
+# 并行(8)取消返回瞬间断言 0 个 worker 存活、0 个任务在跑；
+# 连续 5 次取消无堆积；进入时已带中断仍判定为取消而非超时；
+# 超时不会污染调用线程中断位；串/并行下中断都优先于超时。
+mvn test -Dtest=BatchCancellationCleanupTest
+
+# 真实引擎下的严格断言（零宽限，在 run() 抛出的同一刻直接枚举线程）：
+# 并行取消返回瞬间 batch-worker 立即为 0；连续 3 次重负载取消后再发正常批次成功；
+# 串行取消判定为取消；既有超时/取消/串并行一致用例不回归。
+mvn test -Dtest=BatchRunnerTest
+
+# 多轮重复，确认无 flaky、无线程短暂堆积：
+for i in $(seq 1 10); do mvn test -Dtest=BatchRunnerTest,BatchCancellationCleanupTest; done
+```
+
+判定要点：上述用例在「返回的那一刻」就枚举线程（不带任何等待宽限），因此一旦修复
+不彻底（取消返回时 worker 仍活着）会立刻失败；真实引擎每个模拟小时检查一次中断，
+属于协作式取消，收尾延迟以一个模拟步长为上界。
+
 自动化测试覆盖：
 
+- 取消/超时收尾（`BatchCancellationCleanupTest`、`BatchRunnerTest`）：返回瞬间无 worker
+  存活、无任务在跑；连续多次取消不堆积不串状态；取消与超时语义稳定且互不误报（含进入
+  时已带中断、超时与中断同时发生）；超时不污染调用线程中断位；串/并行行为一致；取消后
+  新批次正常成功。
 - 容量拦截（`CapacityGuardTest`、`CapacityRejectionIntegrationTest`、
   `CapacityPropertiesOverrideTest`）：三个入口、六个资源维度逐维触发、边界含等号、
   首个超限维度稳定、**执行前拒绝（校准 `evaluationsUsed=0`）且不产生任何后台 worker**、

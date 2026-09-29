@@ -30,25 +30,52 @@ import org.springframework.stereotype.Service;
  * (scenario, replications, masterSeed) — never on parallelism or task partitioning.
  *
  * <p>Cancellation/timeout is all-or-nothing: on either, every task is interrupted,
- * the executor is shut down and awaited, and a {@link BatchCancelledException} is
- * thrown. No partial aggregate is ever returned and no task keeps running.
+ * the executor is shut down, and {@code run} blocks until <em>every worker thread
+ * of the batch has actually terminated</em> before throwing
+ * {@link BatchCancelledException}. At the instant the exception propagates to the
+ * caller no background computation is running and no {@code batch-worker} thread
+ * is alive; a new batch is never affected by a previously cancelled one.
+ *
+ * <p>Failure semantics are stable and the same on the serial and parallel paths:
+ * <ul>
+ *   <li>an interrupt (including one already present when {@code run} is entered)
+ *       is always reported as cancellation: {@code isTimeout() == false}, and the
+ *       caller thread keeps its interrupted status;</li>
+ *   <li>an elapsed deadline with no interrupt is always reported as timeout:
+ *       {@code isTimeout() == true}, and the caller thread's interrupt status is
+ *       left untouched (a timeout never poisons the next call);</li>
+ *   <li>if both occur at the same moment, cancellation wins;</li>
+ *   <li>no partial aggregate is ever returned.</li>
+ * </ul>
  */
 @Service
 public class BatchRunner {
 
     private static final Logger log = LoggerFactory.getLogger(BatchRunner.class);
 
+    /** Bounded wait for the pool/worker threads to die during cleanup. */
+    private static final long AWAIT_SECONDS = 30L;
+
     private final CapacityGuard capacityGuard;
+    private final ReplicationExecutor replicationExecutor;
+    private final java.util.concurrent.atomic.AtomicLong batchSequence =
+            new java.util.concurrent.atomic.AtomicLong();
 
     /** Used by Spring: enforces the externally configured capacity limits. */
     @Autowired
     public BatchRunner(CapacityGuard capacityGuard) {
-        this.capacityGuard = capacityGuard;
+        this(capacityGuard, SimulationEngine::run);
     }
 
     /** Convenience constructor for tests with default capacity limits. */
     public BatchRunner() {
         this(new CapacityGuard());
+    }
+
+    /** Package-private seam: substitute the per-replication computation (tests only). */
+    BatchRunner(CapacityGuard capacityGuard, ReplicationExecutor replicationExecutor) {
+        this.capacityGuard = capacityGuard;
+        this.replicationExecutor = replicationExecutor;
     }
 
     /**
@@ -73,6 +100,13 @@ public class BatchRunner {
         // any worker task is scheduled.
         capacityGuard.checkBatch(request);
 
+        // A caller that already carries an interrupt (e.g. an HTTP request whose
+        // connection was closed before we started) must fail fast, be classified
+        // as cancellation — never timeout — and schedule no background work.
+        if (Thread.currentThread().isInterrupted()) {
+            throw new BatchCancelledException(false, "batch cancelled before it started");
+        }
+
         int reps = request.replications();
         long[] seeds = deriveSeeds(request.masterSeed(), reps);
         long deadline = request.timeoutMillis() > 0
@@ -84,9 +118,10 @@ public class BatchRunner {
                 reps, request.parallelism(), request.masterSeed(), request.timeoutMillis(),
                 request.scenario().population(), request.scenario().horizonHours());
 
+        long batchId = batchSequence.incrementAndGet();
         ReplicationResult[] results = request.parallelism() == 1
                 ? runSerial(request, seeds, deadline)
-                : runParallel(request, seeds, deadline);
+                : runParallel(request, seeds, deadline, batchId);
 
         AggregateResult aggregate = aggregate(results);
         log.info("batch done: replications={} parallelism={} masterSeed={} "
@@ -110,13 +145,16 @@ public class BatchRunner {
     private ReplicationResult[] runSerial(BatchRequest request, long[] seeds, long deadline) {
         ReplicationResult[] results = new ReplicationResult[seeds.length];
         for (int k = 0; k < seeds.length; k++) {
-            checkDeadline(deadline, k);
+            // Cancellation takes precedence over timeout: if both are observed at
+            // the same moment the explicit/interrupt signal wins, matching the
+            // parallel path.
             if (Thread.currentThread().isInterrupted()) {
                 Thread.currentThread().interrupt();
                 throw new BatchCancelledException(false, "batch cancelled before replication " + k);
             }
+            checkDeadline(deadline, k);
             try {
-                results[k] = SimulationEngine.run(request.scenario(), seeds[k], k);
+                results[k] = replicationExecutor.run(request.scenario(), seeds[k], k);
             } catch (CancellationException e) {
                 Thread.currentThread().interrupt();
                 throw new BatchCancelledException(false,
@@ -126,14 +164,15 @@ public class BatchRunner {
         return results;
     }
 
-    private ReplicationResult[] runParallel(BatchRequest request, long[] seeds, long deadline) {
+    private ReplicationResult[] runParallel(BatchRequest request, long[] seeds, long deadline,
+                                            long batchId) {
         int reps = seeds.length;
         // Tracks the actual worker threads so cancellation can wait until the OS
         // threads themselves have died (awaitTermination only guarantees task
         // shutdown, not Thread.isAlive()==false).
         java.util.List<Thread> workerThreads = new ArrayList<>();
         java.util.concurrent.ThreadFactory daemonFactory = runnable -> {
-            Thread t = new Thread(runnable, "batch-worker");
+            Thread t = new Thread(runnable, "batch-worker-" + batchId);
             t.setDaemon(true);
             workerThreads.add(t);
             return t;
@@ -141,15 +180,22 @@ public class BatchRunner {
         ExecutorService pool = Executors.newFixedThreadPool(
                 Math.min(request.parallelism(), reps), daemonFactory);
         List<Future<ReplicationResult>> futures = new ArrayList<>(reps);
+        boolean aborted = false;
         try {
             for (int k = 0; k < reps; k++) {
                 final int index = k;
                 Callable<ReplicationResult> task =
-                        () -> SimulationEngine.run(request.scenario(), seeds[index], index);
+                        () -> replicationExecutor.run(request.scenario(), seeds[index], index);
                 futures.add(pool.submit(task));
             }
             ReplicationResult[] results = new ReplicationResult[reps];
             for (int k = 0; k < reps; k++) {
+                // Cancellation takes precedence: if the caller is interrupted at
+                // the same moment the deadline expires, report cancellation.
+                if (Thread.currentThread().isInterrupted()) {
+                    throw new BatchCancelledException(false,
+                            "batch cancelled while waiting for replication " + k);
+                }
                 long remainingNanos = deadline - System.nanoTime();
                 if (remainingNanos <= 0) {
                     throw timeoutException(k);
@@ -159,8 +205,11 @@ public class BatchRunner {
                 } catch (TimeoutException e) {
                     throw timeoutException(k);
                 } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    throw new BatchCancelledException(false, "batch cancelled while waiting for replication " + k);
+                    // Do NOT re-assert the interrupt yet: the cleanup below must
+                    // run with a clear status, otherwise awaiting worker death
+                    // would abort instantly and leak threads.
+                    throw new BatchCancelledException(false,
+                            "batch cancelled while waiting for replication " + k);
                 } catch (ExecutionException e) {
                     Throwable cause = e.getCause();
                     if (cause instanceof CancellationException) {
@@ -174,55 +223,106 @@ public class BatchRunner {
             }
             return results;
         } catch (BatchCancelledException e) {
-            cancelAll(futures, pool, workerThreads);
+            aborted = true;
+            // Interrupt every in-flight task, shut the pool down and block until
+            // every worker thread is actually dead. This wait is deliberately
+            // immune to the caller's own interrupt status, so the guarantee
+            // "cancellation returned => nothing is still running" holds even when
+            // the calling thread is the one that was interrupted.
+            boolean callerWasInterrupted = Thread.interrupted();
+            shutdownAndAwait(futures, pool, workerThreads, true);
+            // Restore the caller's interrupt status only when this was an actual
+            // cancellation that the caller signalled via interrupt. A timeout is
+            // not an interrupt: the caller thread must leave run() with a clear
+            // status, so subsequent calls on that thread are not poisoned.
+            if (!e.isTimeout() && callerWasInterrupted) {
+                Thread.currentThread().interrupt();
+            }
             throw e;
         } catch (RuntimeException e) {
-            cancelAll(futures, pool, workerThreads);
+            aborted = true;
+            shutdownAndAwait(futures, pool, workerThreads, true);
             throw e;
         } finally {
-            // Normal completion path: shut down and also wait for the worker
-            // threads themselves to die, so no "batch-worker" thread outlives
-            // the batch even after a successful return.
-            pool.shutdown();
-            awaitWorkerDeath(pool, workerThreads);
+            if (!aborted) {
+                // Normal completion: shut down gracefully and still wait for the
+                // worker threads themselves to die, so no batch-worker outlives
+                // a successfully returned batch.
+                shutdownAndAwait(futures, pool, workerThreads, false);
+            }
         }
     }
 
     /**
-     * Interrupts every task, shuts the pool down and waits until both the pool
-     * has terminated and every worker thread has actually died. No background
-     * work survives this call.
+     * Cancels (on abort) or shuts down (on success) all tasks, shuts the pool
+     * down and then waits until every worker thread has actually died.
+     *
+     * <p>The wait is bounded and deliberately does not react to the calling
+     * thread's interrupt status: an interrupted caller is exactly the
+     * cancellation case, and returning before the workers are dead would leak
+     * them. Any pre-existing interrupt is cleared for the duration of the wait
+     * and restored afterwards.
      */
-    private static void cancelAll(List<Future<ReplicationResult>> futures, ExecutorService pool,
-                                  java.util.List<Thread> workerThreads) {
-        for (Future<?> f : futures) {
-            f.cancel(true);
-        }
-        pool.shutdownNow();
-        awaitWorkerDeath(pool, workerThreads);
-    }
-
-    /** Awaits pool termination and then joins every worker thread until it is dead. */
-    private static void awaitWorkerDeath(ExecutorService pool, java.util.List<Thread> workerThreads) {
+    private static void shutdownAndAwait(List<Future<ReplicationResult>> futures,
+                                        ExecutorService pool,
+                                        java.util.List<Thread> workerThreads,
+                                        boolean interruptTasks) {
+        boolean callerWasInterrupted = Thread.interrupted();
         try {
-            if (!pool.awaitTermination(30, TimeUnit.SECONDS)) {
-                throw new IllegalStateException("worker pool did not terminate");
+            if (interruptTasks) {
+                for (Future<?> f : futures) {
+                    f.cancel(true);
+                }
+                pool.shutdownNow();
+            } else {
+                pool.shutdown();
             }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
-        for (Thread t : workerThreads) {
-            if (t == Thread.currentThread()) {
-                continue;
+
+            long waitDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(AWAIT_SECONDS);
+            // First wait for the pool to finish tearing tasks down. Retry while
+            // the deadline holds even if an interrupt slips in (it must not,
+            // because we cleared the status, but stay defensive).
+            while (true) {
+                try {
+                    if (pool.awaitTermination(AWAIT_SECONDS, TimeUnit.SECONDS)) {
+                        break;
+                    }
+                    throw new IllegalStateException("worker pool did not terminate");
+                } catch (InterruptedException e) {
+                    if (System.nanoTime() >= waitDeadline) {
+                        throw new IllegalStateException(
+                                "interrupted while waiting for worker pool to terminate");
+                    }
+                    // swallow and keep waiting; interrupt status restored below
+                }
             }
-            try {
-                t.join(30_000L);
-            } catch (InterruptedException e) {
+
+            // awaitTermination only guarantees the pool's tasks have stopped;
+            // join each tracked worker thread so that at return time
+            // Thread.isAlive() is already false for all of them.
+            for (Thread t : workerThreads) {
+                if (t == Thread.currentThread()) {
+                    continue;
+                }
+                long remainingMillis = TimeUnit.NANOSECONDS.toMillis(
+                        Math.max(1L, waitDeadline - System.nanoTime()));
+                try {
+                    t.join(remainingMillis);
+                } catch (InterruptedException e) {
+                    if (System.nanoTime() >= waitDeadline) {
+                        throw new IllegalStateException(
+                                "interrupted while waiting for worker to die");
+                    }
+                    // swallow and keep waiting
+                }
+                if (t.isAlive()) {
+                    throw new IllegalStateException(
+                            "worker thread " + t.getName() + " survived the batch");
+                }
+            }
+        } finally {
+            if (callerWasInterrupted) {
                 Thread.currentThread().interrupt();
-                throw new BatchCancelledException(false, "interrupted while waiting for worker to die");
-            }
-            if (t.isAlive()) {
-                throw new IllegalStateException("worker thread " + t.getName() + " survived the batch");
             }
         }
     }
